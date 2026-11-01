@@ -5,10 +5,17 @@ Apple TV (AirPlay 1, 720p/30fps) from a Windows PC or a Mac.
   python neocast.py portal            # web UI at http://localhost:8080
   python neocast.py video movie.mkv   # CLI; converts to 720p30 if needed
 """
-import argparse, asyncio, functools, hashlib, http.client, json, mimetypes, re, shutil, socket, subprocess, sys
+import argparse, asyncio, functools, hashlib, http.client, json, logging, mimetypes, re, shutil, socket, subprocess, sys
 import threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("neocast")
 
 import pyatv
 from pyatv.const import Protocol
@@ -29,10 +36,11 @@ MIME = {".mp4": "video/mp4", ".m3u8": "application/vnd.apple.mpegurl", ".ts": "v
 cfg = {"host": "192.168.1.108", "library": [str(Path.home() / ("Videos" if WIN else "Movies")),
                                             str(Path.home() / "Music")]}
 state = {"status": "idle", "now": None, "error": None, "device": None,
-         "paused": False, "position": 0, "duration": 0}
+         "paused": False, "position": 0, "duration": 0, "resume_verified": False}
 SESSION = str(uuid.uuid4())   # X-Apple-Session-ID, one per process
 TOKENS, HITS, INDEX, JOBS = {}, {}, {}, []   # token->path, token->fetch count, id->path
 LOOP = task = None
+CFG_LOCK = threading.RLock()
 XLOCK = threading.Lock()   # one ffmpeg conversion at a time
 
 
@@ -45,7 +53,10 @@ def load_cfg():
 
 def save_cfg():
     CACHE.mkdir(parents=True, exist_ok=True)
-    CFG_FILE.write_text(json.dumps(cfg, indent=2))
+    with CFG_LOCK:
+        tmp = CFG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2))
+        tmp.replace(CFG_FILE)
 
 
 def need(tool):
@@ -144,31 +155,237 @@ def start_media_server():
 
 
 # ---------------- probe / convert (Apple TV 2: H.264 Main L3.1, 720p, 30fps, AAC) ----------------
+PROBE_CACHE = {}
+
+
 def probe(path):
     need("ffprobe")
-    return json.loads(subprocess.check_output(
+    p = Path(path).resolve()
+    try:
+        mtime = p.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    if p in PROBE_CACHE and PROBE_CACHE[p][0] == mtime:
+        return PROBE_CACHE[p][1]
+    raw = subprocess.check_output(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format",
-         str(path)]))
+         str(p)])
+    data = json.loads(raw)
+    PROBE_CACHE[p] = (mtime, data)
+    return data
 
 
 def fps_of(v):
     try:
         n, d = v.get("avg_frame_rate", "0/1").split("/")
         return float(n) / float(d) if float(d) else 0.0
-    except (ValueError, ZeroDivisionError):
+    except (ValueError, ZeroDivisionError, AttributeError):
         return 0.0
 
 
+def check_compatibility(info, sub=None, audio=0):
+    """
+    Apple TV 2 hardware playback specifications:
+      - Video: H.264 (Main, Baseline, or Constrained Baseline profile, level <= 3.1,
+               max 1280x720, max 30 fps)
+      - Audio: AAC stereo (selected track)
+      - Container: MP4/M4V/MOV
+      - Subtitles: burn-in requires video transcoding
+
+    Returns a comprehensive dict:
+      mode: 'direct' | 'remux' | 'audio_transcode' | 'video_transcode'
+      reasons: list of reasons why conversion or remuxing is required
+      video_reencode: bool
+      audio_reencode: bool
+      source_text: str (e.g. "536p · 24 fps · HEVC")
+      output_text: str (e.g. "536p · 24 fps · H.264 / AAC")
+      conversion_text: str (e.g. "HEVC → H.264")
+      summary: str
+      source_container: str
+      source_acodec: str
+      out_width: int
+      out_height: int
+      out_fps: float
+    """
+    v = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+    audios = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    fmt = info.get("format", {})
+    fmt_name = fmt.get("format_name", "").lower()
+    container_name = fmt_name.split(",")[0].upper() if fmt_name else "UNKNOWN"
+
+    if not v:
+        return {
+            "mode": "direct", "reasons": [], "video_reencode": False, "audio_reencode": False,
+            "source_text": "Audio only", "output_text": "AirPlay Audio", "conversion_text": "None",
+            "summary": "Audio only", "source_container": container_name, "source_acodec": "",
+            "out_width": 0, "out_height": 0, "out_fps": 0.0, "width": 0, "height": 0,
+            "fps": 0.0, "vcodec": "", "acodec": ""
+        }
+
+    vcodec = v.get("codec_name", "").lower()
+    profile = v.get("profile", "")
+    level_raw = v.get("level")
+    level = None
+    if level_raw is not None:
+        try:
+            level = int(level_raw)
+        except (ValueError, TypeError):
+            pass
+    w = int(v.get("width") or 0)
+    h = int(v.get("height") or 0)
+    fps = fps_of(v)
+
+    video_reasons = []
+    if vcodec not in ("h264", "avc1"):
+        video_reasons.append(f"video codec ({vcodec.upper()} is not supported; requires H.264)")
+    if profile and profile not in ("Main", "Baseline", "Constrained Baseline"):
+        video_reasons.append(f"H.264 profile ({profile} is not supported; requires Main or Baseline)")
+    if level is not None and level > 31:
+        lvl_str = f"{level/10:.1f}" if level > 10 else f"{level}"
+        video_reasons.append(f"H.264 level ({lvl_str} exceeds Apple TV 2 limit 3.1)")
+    if w > 1280 or h > 720:
+        video_reasons.append(f"dimensions ({w}x{h} exceeds 1280x720 limit)")
+    if fps > 30.5:
+        video_reasons.append(f"frame rate ({round(fps, 1)} fps exceeds 30 fps limit)")
+    if sub is not None:
+        video_reasons.append("subtitle burn-in requested")
+
+    selected_audio = audios[audio] if (audios and 0 <= audio < len(audios)) else (audios[0] if audios else None)
+    acodec = selected_audio.get("codec_name", "").lower() if selected_audio else ""
+    audio_reasons = []
+    if selected_audio:
+        if acodec not in ("aac", "mp4a"):
+            audio_reasons.append(f"audio codec ({acodec.upper() if acodec else 'unknown'} requires AAC)")
+
+    container_reasons = []
+    is_mp4 = any(ext in fmt_name for ext in ("mp4", "m4v", "mov"))
+    if not is_mp4:
+        container_reasons.append(f"container ({container_name} is not MP4)")
+
+    if video_reasons:
+        mode = "video_transcode"
+        video_reencode = True
+        audio_reencode = True
+        reasons = video_reasons + container_reasons + audio_reasons
+    elif audio_reasons:
+        mode = "audio_transcode"
+        video_reencode = False
+        audio_reencode = True
+        reasons = audio_reasons + container_reasons
+    elif container_reasons:
+        mode = "remux"
+        video_reencode = False
+        audio_reencode = False
+        reasons = container_reasons
+    else:
+        mode = "direct"
+        video_reencode = False
+        audio_reencode = False
+        reasons = []
+
+    # Calculate output dimensions: preserve source resolution when fitting inside 1280x720
+    if w > 0 and h > 0:
+        if w > 1280 or h > 720:
+            factor = min(1280.0 / w, 720.0 / h)
+            out_w = int(round(w * factor / 2.0)) * 2
+            out_h = int(round(h * factor / 2.0)) * 2
+        else:
+            out_w = int(w / 2) * 2
+            out_h = int(h / 2) * 2
+    else:
+        out_w = min(w, 1280) if w else 1280
+        out_h = min(h, 720) if h else 720
+
+    out_fps = 30.0 if fps > 30.5 else fps
+
+    # Build source details string
+    fps_label = f"{round(fps)} fps" if fps else ""
+    src_parts = [f"{h}p" if h else "", fps_label, vcodec.upper() if vcodec else ""]
+    src_core = " · ".join([p for p in src_parts if p])
+    if acodec:
+        src_core += f" / {acodec.upper()}"
+    if not is_mp4:
+        src_core += f" ({container_name})"
+    source_text = src_core
+
+    # Build prepared-output details string
+    out_fps_label = f"{round(out_fps)} fps" if out_fps else ""
+    out_parts = [f"{out_h}p" if out_h else "", out_fps_label, "H.264 / AAC"]
+    output_text = " · ".join([p for p in out_parts if p])
+
+    # Build specific conversion required string
+    if mode == "direct":
+        conversion_text = "None (plays directly)"
+    elif mode == "remux":
+        conversion_text = f"Container remux: {container_name} → MP4 (no video re-encoding)"
+    elif mode == "audio_transcode":
+        conversion_text = f"Audio conversion: {acodec.upper()} → AAC (video stream copied)"
+    else:
+        c_parts = []
+        if vcodec not in ("h264", "avc1"):
+            c_parts.append(f"{vcodec.upper()} → H.264")
+        elif profile and profile not in ("Main", "Baseline", "Constrained Baseline"):
+            c_parts.append(f"{profile} → Main profile")
+        elif level is not None and level > 31:
+            lvl_val = level / 10.0 if level > 10 else float(level)
+            c_parts.append(f"Level {lvl_val:.1f} → 3.1")
+        if w > 1280 or h > 720:
+            c_parts.append(f"{w}x{h} → {out_w}x{out_h}")
+        if fps > 30.5:
+            c_parts.append(f"{round(fps)} fps → 30 fps")
+        if sub is not None:
+            c_parts.append("Burn subtitles")
+        if not c_parts:
+            c_parts.append(f"{vcodec.upper()} → H.264")
+        conversion_text = " · ".join(c_parts)
+
+    if mode == "direct":
+        summary = f"Source: {source_text} · Plays directly"
+    else:
+        summary = f"Source: {source_text}\nConversion required: {conversion_text}\nOutput: {output_text}"
+
+    return {
+        "mode": mode,
+        "reasons": reasons,
+        "video_reencode": video_reencode,
+        "audio_reencode": audio_reencode,
+        "source_text": source_text,
+        "output_text": output_text,
+        "conversion_text": conversion_text,
+        "summary": summary,
+        "source_container": container_name,
+        "source_acodec": acodec.upper() if acodec else "",
+        "out_width": out_w,
+        "out_height": out_h,
+        "out_fps": out_fps,
+        "width": w,
+        "height": h,
+        "fps": fps,
+        "vcodec": vcodec,
+        "acodec": acodec
+    }
+
+
 def is_compatible(info):
-    v = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
-    a = [s for s in info["streams"] if s["codec_type"] == "audio"]
-    return bool(v and "mp4" in info["format"]["format_name"]
-                and v["codec_name"] == "h264"
-                and v.get("profile") in ("Main", "Baseline", "Constrained Baseline")
-                and int(v.get("level", 99)) <= 31
-                and int(v.get("height", 9999)) <= 720 and int(v.get("width", 9999)) <= 1280
-                and fps_of(v) <= 30.5
-                and (not a or a[0]["codec_name"] == "aac"))
+    return check_compatibility(info)["mode"] == "direct"
+
+
+def get_cache_path(src, sub=None, audio=0):
+    src = Path(src).resolve()
+    try:
+        mtime = src.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    key = f"{src}|{mtime}|s{sub}|a{audio}"
+    return CACHE / (hashlib.md5(key.encode()).hexdigest()[:12] + ".mp4")
+
+
+def is_cached(src, sub=None, audio=0):
+    try:
+        p = get_cache_path(src, sub, audio)
+        return p.exists() and p.stat().st_size > 0
+    except OSError:
+        return False
 
 
 @functools.lru_cache(maxsize=1)
@@ -197,42 +414,78 @@ def sub_file(src, track):
     return dst.name
 
 
-def transcode(src, info, job, sub=None, audio=0):
-    key = f"{src}|{src.stat().st_mtime_ns}|s{sub}|a{audio}"
-    out = CACHE / (hashlib.md5(key.encode()).hexdigest()[:12] + ".mp4")
-    if out.exists():
-        return out
+def run_preparation(src, info, analysis, out, job, sub=None, audio=0):
     need("ffmpeg")
-    job.update(stage="converting", pct=0)
-    vf = "scale=-2:'min(720,ih)',format=yuv420p"
-    if sub is not None:   # burn at source size, then scale; run in CACHE so the filter path is plain
-        vf = f"subtitles={sub_file(src, sub)}," + vf
-    dur = float(info["format"].get("duration") or 0)
-    v = next(s for s in info["streams"] if s["codec_type"] == "video")
+    mode = analysis["mode"]
+    dur = float(info.get("format", {}).get("duration") or 0)
+    v = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
     tmp = out.with_suffix(".part.mp4")
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
-           "-i", str(src), "-map", "0:v:0", "-map", f"0:a:{audio}?", "-vf", vf]
-    if fps_of(v) > 30.5:
-        cmd += ["-r", "30"]
-    cmd += ["-c:v", "libx264", "-profile:v", "main", "-level", "3.1", "-preset", "veryfast",
-            "-crf", "22", "-maxrate", "4M", "-bufsize", "6M",
-            "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-movflags", "+faststart",
-            "-f", "mp4", str(tmp)]
+    tmp.unlink(missing_ok=True)
+
+    if mode == "remux":
+        label = "Remuxing container"
+        job.update(stage="converting", label=label, pct=0)
+        logger.info(f"[prepare] Remuxing container for '{src.name}' -> {out.name}")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
+               "-i", str(src), "-map", "0:v:0", "-map", f"0:a:{audio}?",
+               "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart",
+               "-f", "mp4", str(tmp)]
+    elif mode == "audio_transcode":
+        label = "Converting audio"
+        job.update(stage="converting", label=label, pct=0)
+        logger.info(f"[prepare] Converting audio ({analysis['source_acodec']} -> AAC) for '{src.name}' -> {out.name}")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
+               "-i", str(src), "-map", "0:v:0", "-map", f"0:a:{audio}?",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+               "-movflags", "+faststart", "-f", "mp4", str(tmp)]
+    else:  # video_transcode
+        label = "Converting video"
+        job.update(stage="converting", label=label, pct=0)
+        logger.info(f"[prepare] Transcoding video ({analysis['conversion_text']}) for '{src.name}' -> {out.name}")
+
+        w, h = analysis["width"], analysis["height"]
+        if w > 1280 or h > 720:
+            vf = "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+        elif w % 2 != 0 or h % 2 != 0:
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+        else:
+            vf = "format=yuv420p"
+
+        if sub is not None:
+            vf = f"subtitles={sub_file(src, sub)}," + vf
+
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
+               "-i", str(src), "-map", "0:v:0", "-map", f"0:a:{audio}?", "-vf", vf]
+
+        if fps_of(v) > 30.5:
+            cmd += ["-r", "30"]
+
+        cmd += ["-c:v", "libx264", "-profile:v", "main", "-level", "3.1", "-preset", "veryfast",
+                "-crf", "22", "-maxrate", "4M", "-bufsize", "6M",
+                "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-movflags", "+faststart",
+                "-f", "mp4", str(tmp)]
+
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=CACHE,
                          text=True, encoding="utf-8", errors="replace")
     tail = []
     for line in p.stdout:
-        if line.startswith("out_time_ms=") and dur:
+        if line.startswith("out_time_ms=") and dur > 0:
             try:
                 job["pct"] = min(99, int(line.split("=")[1]) / 1e6 / dur * 100)
             except ValueError:
                 pass
         elif "=" not in line:
             tail = (tail + [line.strip()])[-3:]
+
     if p.wait() != 0:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError("ffmpeg conversion failed: " + " ".join(tail))
+        err = f"ffmpeg conversion failed: {' '.join(tail)}"
+        logger.error(f"[prepare] {err}")
+        raise RuntimeError(err)
+
+    job["pct"] = 100
     tmp.replace(out)
+    logger.info(f"[prepare] Conversion complete: {out.name} ({out.stat().st_size} bytes)")
     return out
 
 
@@ -240,15 +493,31 @@ def prepare(src, job=None, sub=None, audio=0):
     """Return a path the Apple TV can play, converting (and caching) if needed.
     sub = embedded subtitle track to burn in (None = off); audio = audio track index."""
     job = {} if job is None else job
-    src = Path(src)
+    src = Path(src).expanduser().resolve()
+    CACHE.mkdir(parents=True, exist_ok=True)
     if src.suffix.lower() in AUDIO:
         return src
     job["stage"] = "checking"
     info = probe(src)
-    if sub is None and audio == 0 and is_compatible(info):
+    analysis = check_compatibility(info, sub, audio)
+
+    if analysis["mode"] == "direct":
+        logger.info(f"[prepare] Compatibility check passed for '{src.name}': direct playback")
         return src
+    else:
+        logger.info(f"[prepare] Compatibility check requires {analysis['mode']} for '{src.name}'. Reasons: {', '.join(analysis['reasons'])}")
+
+    cached_out = get_cache_path(src, sub, audio)
+    if cached_out.exists() and cached_out.stat().st_size > 0:
+        logger.info(f"[prepare] Preparation mode selected: {analysis['mode']}. Reusing cached file: {cached_out.name}")
+        return cached_out
+
     with XLOCK:
-        return transcode(src, info, job, sub, audio)
+        if cached_out.exists() and cached_out.stat().st_size > 0:
+            logger.info(f"[prepare] Preparation mode selected: {analysis['mode']}. Reusing cached file (post-lock): {cached_out.name}")
+            return cached_out
+        logger.info(f"[prepare] Preparation mode selected: {analysis['mode']}. Generating new file: {cached_out.name}")
+        return run_preparation(src, info, analysis, cached_out, job, sub, audio)
 
 
 def download(url, job):
@@ -390,45 +659,102 @@ def seek(position=None, delta=None):
 
 
 async def play_media(atv, url, tok, key=None, start=0, live=False):
-    """pyatv play_url (the call verified on the Apple TV 2: a raw POST /play is accepted
-    but the box never fetches the file). We add: confirm the box fetched the file, then
-    poll raw /scrub for position (used for the UI and resume). `start` is in seconds."""
-    host, loop = state["device"], asyncio.get_running_loop()
-    t = asyncio.ensure_future(atv.stream.play_url(url, position=int(start)))
+    """Start media on Apple TV, verify initial playback position, issue and verify
+    seeking with bounded retries if needed, and poll scrub status for UI and resume."""
+    host, loop = state['device'], asyncio.get_running_loop()
+    start = max(0.0, float(start or 0))
+    logger.info(f"[play_media] Requested start position: {start:.3f}s (units: seconds) for key='{key}'")
+    t = asyncio.ensure_future(atv.stream.play_url(url, position=0))
     pos = dur = 0.0
+    reliable = False
+    natural_end = False
+
+    async def request(method, path):
+        return await loop.run_in_executor(None, lambda: airplay_request(host, method, path, timeout=3))
+
+    def record(p, d):
+        nonlocal pos, dur, reliable
+        pos, dur, reliable = p, d, True
+        state.update(position=p, duration=d)
+        if key and not live:
+            set_saved_pos(key, p, d)
+
     try:
         for _ in range(60):
             if HITS.get(tok) or t.done():
                 break
             await asyncio.sleep(0.25)
         if not HITS.get(tok):
-            if t.done():
-                t.result()
-            raise RuntimeError(f"Apple TV never fetched the media. Firewall blocking "
-                               f"TCP {MEDIA_PORT}? Wrong network?")
-        state.update(status="playing", paused=False)
+            if t.done(): t.result()
+            raise RuntimeError(f'Apple TV never fetched media. Check TCP {MEDIA_PORT} and the network.')
+        state.update(status='connecting' if not live else 'playing', paused=False,
+                     resume_target=start, resume_verified=False)
+        if not live:
+            deadline = loop.time() + 35
+            last_seek = 0.0
+            seek_sent = False
+            verified = False
+            seek_attempts = 0
+            while loop.time() < deadline and not t.done():
+                try:
+                    code, text = await request('GET', '/scrub')
+                    p, d = parse_scrub(text)
+                    if code == 200 and d > 0:
+                        target = min(start, max(0, d - 1))
+                        if seek_attempts == 0 and not seek_sent:
+                            logger.info(f"[play_media] Initial playback reading: position={p:.3f}s, duration={d:.3f}s (requested={start:.3f}s)")
+                        if (start == 0 or seek_sent) and abs(p - target) <= 8:
+                            record(p, d)
+                            verified = True
+                            break
+                        if loop.time() - last_seek >= 4:
+                            seek_attempts += 1
+                            code, _ = await request('POST', f'/scrub?position={target:.3f}')
+                            logger.info(f"[play_media] Seek attempt #{seek_attempts} to {target:.3f}s (HTTP {code}); observed {p:.3f}s")
+                            seek_sent = code == 200
+                            last_seek = loop.time()
+                except (OSError, http.client.HTTPException):
+                    pass
+                await asyncio.sleep(1)
+            if not verified:
+                try: await request('POST', '/stop')
+                except Exception: pass
+                err_msg = f"Apple TV refused seek to {fmt_time(start)} ({start:.0f}s) or position could not be verified. Saved resume point was preserved."
+                logger.error(f"[play_media] {err_msg}")
+                raise RuntimeError(err_msg)
+            state.update(status='playing', resume_verified=True)
+            logger.info(f"[play_media] Verified playback position: {pos:.3f}s (requested={start:.3f}s)")
         polls = 0
         while not t.done():
             await asyncio.sleep(2)
-            try:   # experimental: a second, plain HTTP connection to the box
-                code, text = await loop.run_in_executor(
-                    None, lambda: airplay_request(host, "GET", "/scrub", timeout=3))
+            try:
+                code, text = await request('GET', '/scrub')
             except (OSError, http.client.HTTPException):
                 continue
-            if code == 200 and parse_scrub(text)[1]:
-                pos, dur = parse_scrub(text)
-                state.update(position=pos, duration=dur)
-                if key and not live:
-                    cfg.setdefault("positions", {})[key] = [pos, dur]
+            p, d = parse_scrub(text)
+            if code == 200 and d > 0:
+                if p == 0.0 and start > 30 and pos > 30:
+                    logger.info(f"[play_media] Reading of 0.0s during playback ignored; keeping {pos:.1f}s")
+                    continue
+                if p > 0 or not reliable or pos < 8:
+                    record(p, d)
                     polls += 1
-                    if polls % 5 == 0:
+                    if key and not live and polls % 3 == 0:
                         save_cfg()
         await t
+        natural_end = True
     finally:
         t.cancel()
-        if key and dur:
-            if pos >= dur - 30:   # watched to the end
-                cfg.get("positions", {}).pop(key, None)
+        await asyncio.gather(t, return_exceptions=True)
+        if key and not live:
+            if reliable and natural_end and pos >= dur - 15:
+                logger.info(f"[play_media] Playback watched to end ({pos:.1f}/{dur:.1f}s). Clearing saved position for '{key}'")
+                clear_saved_pos(key)
+            elif reliable and pos > 0:
+                logger.info(f"[play_media] Playback ended. Saving reliable position for '{key}': {pos:.1f}/{dur:.1f}s")
+                set_saved_pos(key, pos, dur)
+            else:
+                logger.info(f"[play_media] Playback session ended without reliable progress ({pos:.1f}s); intentionally not overwriting saved resume point for '{key}'")
             save_cfg()
 
 
@@ -437,6 +763,7 @@ def file_work(path, key=None, start=0):
         if Path(path).suffix.lower() in AUDIO:
             state["status"] = "playing"
             return await atv.stream.stream_file(str(path))
+        state["cur"] = add_index(Path(key)) if key else None
         tok = register(path)
         await play_media(atv, f"http://{ip}:{MEDIA_PORT}/m/{tok}/video.mp4", tok, key, start)
     return w
@@ -533,10 +860,57 @@ def selftest():
          "width": 1280, "height": 720, "avg_frame_rate": "30000/1001"},
         {"codec_type": "audio", "codec_name": "aac"}]}
     assert is_compatible(ok)
-    ok["streams"][0]["height"] = 1080
-    assert not is_compatible(ok)
-    ok["streams"][0].update(height=720, avg_frame_rate="60/1")
-    assert not is_compatible(ok)
+    assert check_compatibility(ok)["mode"] == "direct"
+
+    # Incompatible height
+    ok_1080 = {"format": {"format_name": "mov,mp4,m4a"}, "streams": [
+        {"codec_type": "video", "codec_name": "h264", "profile": "Main", "level": 31,
+         "width": 1920, "height": 1080, "avg_frame_rate": "24/1"},
+        {"codec_type": "audio", "codec_name": "aac"}]}
+    c_1080 = check_compatibility(ok_1080)
+    assert not is_compatible(ok_1080)
+    assert c_1080["mode"] == "video_transcode"
+    assert c_1080["out_width"] == 1280 and c_1080["out_height"] == 720
+    assert c_1080["out_fps"] == 24.0
+
+    # Incompatible fps
+    ok_60fps = {"format": {"format_name": "mov,mp4,m4a"}, "streams": [
+        {"codec_type": "video", "codec_name": "h264", "profile": "Main", "level": 31,
+         "width": 1280, "height": 720, "avg_frame_rate": "60/1"},
+        {"codec_type": "audio", "codec_name": "aac"}]}
+    assert not is_compatible(ok_60fps)
+    assert check_compatibility(ok_60fps)["mode"] == "video_transcode"
+    assert check_compatibility(ok_60fps)["out_fps"] == 30.0
+
+    # 536p HEVC: video transcode, preserves 536p and 24fps
+    hevc_536 = {"format": {"format_name": "mov,mp4,m4a"}, "streams": [
+        {"codec_type": "video", "codec_name": "hevc", "profile": "Main",
+         "width": 1280, "height": 536, "avg_frame_rate": "24/1"},
+        {"codec_type": "audio", "codec_name": "aac"}]}
+    c_536 = check_compatibility(hevc_536)
+    assert c_536["mode"] == "video_transcode"
+    assert c_536["out_height"] == 536 and c_536["out_fps"] == 24.0
+    assert "HEVC → H.264" in c_536["conversion_text"]
+    assert "536p" in c_536["output_text"]
+
+    # Remux: MKV container with compatible H.264 and AAC
+    mkv_ok = {"format": {"format_name": "matroska,webm"}, "streams": [
+        {"codec_type": "video", "codec_name": "h264", "profile": "Main", "level": 31,
+         "width": 1280, "height": 720, "avg_frame_rate": "24/1"},
+        {"codec_type": "audio", "codec_name": "aac"}]}
+    c_mkv = check_compatibility(mkv_ok)
+    assert c_mkv["mode"] == "remux"
+    assert not c_mkv["video_reencode"] and not c_mkv["audio_reencode"]
+
+    # Audio transcode: AC3 audio with compatible H.264
+    ac3_ok = {"format": {"format_name": "mov,mp4,m4a"}, "streams": [
+        {"codec_type": "video", "codec_name": "h264", "profile": "Main", "level": 31,
+         "width": 1280, "height": 720, "avg_frame_rate": "24/1"},
+        {"codec_type": "audio", "codec_name": "ac3"}]}
+    c_ac3 = check_compatibility(ac3_ok)
+    assert c_ac3["mode"] == "audio_transcode"
+    assert not c_ac3["video_reencode"] and c_ac3["audio_reencode"]
+
     print("selftest ok")
 
 
@@ -585,9 +959,8 @@ def portal():
     def library():
         if not INDEX:
             scan_library()
-        pos = cfg.get("positions", {})
         return [{"id": i, "name": p.name, "mb": round(p.stat().st_size / 1048576),
-                 "audio": p.suffix.lower() in AUDIO, "resume": int(pos.get(str(p), [0])[0])}
+                 "audio": p.suffix.lower() in AUDIO, "resume": int(get_saved_pos(p)[0])}
                 for i, p in sorted(INDEX.items(), key=lambda kv: kv[1].name.lower())]
 
     @app.post("/api/rescan")
@@ -602,18 +975,31 @@ def portal():
         if not p:
             return {"ok": False, "error": "unknown file"}
         sub = body.get("sub")   # None = off, -1 = sidecar .srt, N = embedded track
-        saved = cfg.get("positions", {}).get(str(p))
-        start = 0 if body.get("restart") or not saved else saved[0]
-        if body.get("at"):   # re-play from here (subtitle/audio change)
-            start = body["at"]
+        
+        if body.get("restart"):
+            start = 0.0
+            set_saved_pos(p, 0.0, get_saved_pos(p)[1])
+            save_cfg()
+            logger.info(f"[/api/play] Restart requested for '{p.name}'. Starting at 0.0s")
+        elif body.get("at") is not None:
+            try:
+                start = max(0.0, float(body["at"]))
+            except (ValueError, TypeError):
+                start = 0.0
+            logger.info(f"[/api/play] Explicit position requested for '{p.name}': {start:.2f}s ({fmt_time(start)})")
+        else:
+            saved = get_saved_pos(p)
+            start = max(0.0, float(saved[0])) if saved else 0.0
+            logger.info(f"[/api/play] Resuming '{p.name}' at saved position: {start:.2f}s ({fmt_time(start)})")
+
         rec = cfg.setdefault("recent", [])
-        rec[:] = [r for r in rec if r["path"] != str(p)]
-        rec.insert(0, {"path": str(p), "t": time.time(), "sub": body.get("label")})
+        rec[:] = [r for r in rec if r["path"] != str(p) and r["path"] != str(p.resolve())]
+        rec.insert(0, {"path": str(p.resolve()), "t": time.time(), "sub": body.get("label")})
         del rec[12:]
         save_cfg()
         state["cur"] = fid
         return run_job(p.stem, lambda job: prepare(p, job, sub, int(body.get("audio") or 0)),
-                       lambda ready: file_work(ready, str(p), start))
+                       lambda ready: file_work(ready, str(p.resolve()), start))
 
     @app.post("/api/youtube")
     def youtube(body: dict):
@@ -677,7 +1063,7 @@ def portal():
         for r in cfg.get("recent", []):
             p = Path(r["path"])
             if p.is_file():
-                pos = cfg.get("positions", {}).get(str(p), [0, 0])
+                pos = get_saved_pos(p)
                 out.append({"id": add_index(p), "name": p.stem, "size": p.stat().st_size,
                             "t": r["t"], "sub": r.get("sub"), "pos": pos[0], "dur": pos[1]})
         return out
@@ -700,38 +1086,57 @@ def portal():
         return FileResponse(out)
 
     @app.get("/api/tracks/{fid}")
-    def tracks(fid: str):
+    def tracks(fid: str, audio: int = 0, sub: int | None = None):
         p = INDEX.get(fid)
         if not p:
             return {"ok": False, "error": "unknown file"}
-        resume = int(cfg.get("positions", {}).get(str(p), [0])[0])
+        resume = int(get_saved_pos(p)[0])
         if p.suffix.lower() in AUDIO:
-            return {"ok": True, "subs": [], "audios": [], "direct": True, "video": "audio only",
-                    "summary": "Music, streamed over AirPlay audio", "burn_ok": False, "resume": resume}
+            return {"ok": True, "id": fid, "subs": [], "audios": [], "direct": True,
+                    "cached": False, "mode": "direct", "video": "audio only",
+                    "source_text": "Audio only", "conversion_text": "", "output_text": "AirPlay Audio",
+                    "summary": "Music, streamed over AirPlay audio", "burn_ok": False, "resume": resume,
+                    "reasons": []}
         try:
             info = probe(p)
         except (RuntimeError, subprocess.CalledProcessError) as e:
             return {"ok": False, "error": f"could not read file: {e}"}
         subs, auds, v = [], [], None
-        for st in info["streams"]:
+        for st in info.get("streams", []):
             t = st.get("tags", {})
             base = {"lang": t.get("language", "und"), "title": t.get("title", ""),
                     "codec": st.get("codec_name", "")}
-            if st["codec_type"] == "video" and not v:
+            if st.get("codec_type") == "video" and not v:
                 v = st
-            elif st["codec_type"] == "subtitle":
+            elif st.get("codec_type") == "subtitle":
                 subs.append({**base, "i": len(subs), "text": base["codec"] not in
                              ("hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub")})
-            elif st["codec_type"] == "audio":
+            elif st.get("codec_type") == "audio":
                 auds.append({**base, "i": len(auds), "ch": st.get("channels")})
         if p.with_suffix(".srt").exists():
             subs.insert(0, {"i": -1, "lang": "ext", "title": p.with_suffix(".srt").name,
                             "codec": "srt", "text": True})
-        direct = is_compatible(info)
+
+        analysis = check_compatibility(info, sub, audio)
+        cached = is_cached(p, sub, audio)
         vtxt = f"{v.get('height', '?')}p {round(fps_of(v))}fps {v.get('codec_name', '')}" if v else "no video"
-        return {"ok": True, "subs": subs, "audios": auds, "direct": direct, "video": vtxt,
-                "burn_ok": has_libass(), "resume": resume,
-                "summary": f"{vtxt} · " + ("plays directly" if direct else "will be converted to 720p / 30fps")}
+        return {
+            "ok": True,
+            "id": fid,
+            "subs": subs,
+            "audios": auds,
+            "direct": analysis["mode"] == "direct",
+            "cached": cached,
+            "mode": analysis["mode"],
+            "reasons": analysis["reasons"],
+            "video": vtxt,
+            "burn_ok": has_libass(),
+            "resume": resume,
+            "source_text": analysis["source_text"],
+            "conversion_text": analysis["conversion_text"] if analysis["mode"] != "direct" else "",
+            "output_text": analysis["output_text"],
+            "summary": analysis["summary"]
+        }
 
     @app.post("/api/match")
     def match(body: dict):
@@ -777,6 +1182,7 @@ def portal():
         if state["status"] in ("playing", "connecting") or any(
                 j["stage"] not in ("done", "error") for j in JOBS):
             return {"ok": False, "error": "Stop playback and wait for conversions to finish first."}
+        CACHE.mkdir(parents=True, exist_ok=True)
         freed = cache_bytes()
         for f in CACHE.iterdir():
             shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink(missing_ok=True)
@@ -847,12 +1253,20 @@ def main():
             if not path.is_file():
                 sys.exit(f"File not found: {path}")
             if args.cmd == "video":
-                print("Checking / converting to 720p30 if needed ...")
-                key, path = str(path), prepare(path, {}, args.sub, args.audio_track)
-                saved = cfg.get("positions", {}).get(key)
+                key = str(path)
+                info = probe(path)
+                analysis = check_compatibility(info, args.sub, args.audio_track)
+                print(f"Source: {analysis['source_text']}")
+                if analysis["mode"] != "direct":
+                    print(f"Conversion required: {analysis['conversion_text']}")
+                    print(f"Output: {analysis['output_text']}")
+                else:
+                    print("Direct playback: media is fully compatible")
+                ready = prepare(path, {}, args.sub, args.audio_track)
+                saved = get_saved_pos(path)
                 start_media_server()
-                cli_run(path.name, file_work(path, key, 0 if args.restart or not saved
-                                             else saved[0]))
+                start = 0 if args.restart or not saved else saved[0]
+                cli_run(path.name, file_work(ready, key, start))
             else:
                 cli_run(path.name, file_work(path))
         elif args.cmd == "live":
